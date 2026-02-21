@@ -23,10 +23,7 @@ Serving installer on <your ip address>:42069...
 6. PS Button to go home > Settings > Application Saved Data Management > Saved Data In System Storage > Copy To USB > PS Vue > Check Mark Application Data > Copy.
 7. Open Vue
 8. Wait 10 seconds
-
-open Playstation Vue
-
-Follow on screen instructions
+9. Follow on screen instructions
 
 ## Public Server Save file 
 
