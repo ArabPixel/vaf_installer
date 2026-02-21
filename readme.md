@@ -1,11 +1,28 @@
-edit save from savedata with your localip and port 8000
+# Vue After Free Installer 
 
-encrypt it with `python encrypt.py localstorage`
+## Usage 
+```
+git clone https://github.com/Vuemony/vaf_installer/
+cd vaf_installer
+chmod +x deploy.sh
+./deploy.sh 
+```
 
-add `localstorage.aes` with Apollo
+then after it is done building it will output 
 
-run `python server.py` from this directory
+```
+Save file in /deploy/savedata/localstorage.aes
+Serving installer on <your ip address>:42069...
+```
 
-start vue
+install `localstorage.aes` with Apollo Save tool
 
-lite mode will install in download0 and jailbreak.
+open Playstation Vue
+
+Follow on screen instructions
+
+## Public Server Save file 
+
+optionally the files are hosted remotely and the save has been already generated in [releases](https://github.com/Vuemony/vaf_installer/releases/latest)
+
+simply install it with Apollo Save Tool and create a backup in Settings > Save Data Management
