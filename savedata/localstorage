@@ -1,0 +1,3 @@
+appConfig={"forceCachedPayloadAuth":true}
+manifestUrl=http://REPLACE_IP:REPLACE_PORT/manifest.aes
+lastRequestPayload={"token":"fake_bypass_token","user_id":"12345"}

