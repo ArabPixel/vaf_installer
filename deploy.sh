@@ -18,15 +18,12 @@ if [ "$1" = "clean" ]; then
 fi
 
 if [ -z "$1" ]; then
-    echo "Usage: $0 <ip_or_domain> [port]"
-    echo "       $0 clean"
-    echo "  e.g. $0 earthonion.com"
-    echo "  e.g. $0 203.0.113.50 9000"
-    exit 1
+    HOST=$(python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('10.255.255.255',1)); print(s.getsockname()[0]); s.close()" 2>/dev/null || echo "127.0.0.1")
+    PORT=42069
+else
+    HOST="$1"
+    PORT="${2:-80}"
 fi
-
-HOST="$1"
-PORT="${2:-80}"
 OUT_DIR="$SCRIPT_DIR/deploy"
 ENCRYPT="$SCRIPT_DIR/savedata/encrypt.py"
 
@@ -179,7 +176,7 @@ echo ""
 
 echo "=== Done ==="
 echo ""
-echo "Save file in $OUT_DIR/savedata/"
+echo -e "Save file in \033[32m$OUT_DIR/savedata/\033[0m"
 echo ""
 echo -e "Serving installer on \033[31m$HOST:$PORT\033[0m..."
 python3 "$SCRIPT_DIR/server.py" "$PORT"
